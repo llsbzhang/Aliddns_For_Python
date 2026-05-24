@@ -1,5 +1,5 @@
 > [!放在开头]
-> wdf,你说我要写文档？
+> 已优化重构，使用gpt5.3 - codex辅助开发
 
 *众所周知，这是第二个版本的readme，由郑某喵整理*
 ###### 语言选择（language choice）
@@ -23,16 +23,16 @@
 **格式如下：**
 ```json
 "Interval": "1",
-            "AccessKeyId": "yourAccessKeyId",
-            "AccessKeySecret": "yourAccessKeySecret",
-            "DomainName": "Your Domain name | example: github.com",
-            "SubDomainName": "Your subDomain name | example:www",
-            "Type": "A",
-            "Line": "default",
-            "TTL": "600",
-            "GetIpUrls": [
-                "https://api.ipify.org",
-                "https://ident.me"
+    "AccessKeyId": "yourAccessKeyId",
+    "AccessKeySecret": "yourAccessKeySecret",
+    "DomainName": "Your Domain name | example: github.com",
+    "SubDomainName": "Your subDomain name | example:www",
+    "Type": "A",
+    "Line": "default",
+    "TTL": "600",
+    "GetIpUrls": [
+        "https://api.ipify.org",
+        "https://ident.me"
 ```
 打开它，塞入你的**AccessKey ID** ， **AccessKey Secret** ， **域名和子域名**
 再次运行即可（）
