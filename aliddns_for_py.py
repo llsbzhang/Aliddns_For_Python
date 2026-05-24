@@ -1,239 +1,458 @@
-import requests
-import json
-import time
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import base64
 import hashlib
 import hmac
-import base64
-import urllib.parse
-import sys
+import ipaddress
+import json
+import logging
+import logging.handlers
 import os
+import signal
+import sys
+import threading
+import time
+import urllib.parse
+import uuid
+from typing import Any, Dict, Optional
+
+import requests
+
+
+DEFAULT_CONFIG = {
+    "Interval": 60,
+    "AccessKeyId": "yourAccessKeyId",
+    "AccessKeySecret": "yourAccessKeySecret",
+    "DomainName": "example.com",
+    "SubDomainName": "home",
+    "Type": "A",
+    "Line": "default",
+    "TTL": 600,
+    "GetIpUrls": [
+        "https://api.ipify.org",
+        "https://ident.me",
+        "https://checkip.amazonaws.com"
+    ],
+    "LogFile": "aliddns.log",
+    "PidFile": "aliddns.pid"
+}
+
+
+class PidFile:
+    def __init__(self, pid_file: str):
+        self.pid_file = pid_file
+
+    def exists(self) -> bool:
+        if not os.path.exists(self.pid_file):
+            return False
+        try:
+            with open(self.pid_file, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    def read_pid(self) -> Optional[int]:
+        try:
+            with open(self.pid_file, "r", encoding="utf-8") as f:
+                return int(f.read().strip())
+        except Exception:
+            return None
+
+    def write(self):
+        with open(self.pid_file, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+
+    def remove(self):
+        try:
+            if os.path.exists(self.pid_file):
+                os.remove(self.pid_file)
+        except Exception:
+            pass
+
 
 class AliDDNS:
-    def __init__(self, config_file="config.json"):
+    def __init__(self, config_file: str = "config.json"):
+        self.config_file = config_file
         self.config = self.load_config(config_file)
-        self.current_ip = None
-        self.running = True
+        self.validate_config()
+
         self.endpoint = "https://alidns.aliyuncs.com"
-    
-    def load_config(self, config_file):
-        with open(config_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    
-    def get_public_ip(self):
-        urls = self.config.get("GetIpUrls", [
-            "https://api.ipify.org", 
-            "https://ident.me",
-            "https://checkip.amazonaws.com"
-        ])
-        
-        for url in urls:
-            try:
-                response = requests.get(url, timeout=8)
-                if response.status_code == 200:
-                    ip = response.text.strip()
-                    if self.is_valid_ip(ip):
-                        return ip
-            except:
-                continue
-        return None
-    
-    def is_valid_ip(self, ip):
-        parts = ip.split('.')
-        if len(parts) != 4:
-            return False
-        return all(part.isdigit() and 0 <= int(part) <= 255 for part in parts)
-    
-    def sign_request(self, params):
-        params.update({
-            'Format': 'JSON',
-            'Version': '2015-01-09',
-            'AccessKeyId': self.config['AccessKeyId'],
-            'SignatureMethod': 'HMAC-SHA1',
-            'Timestamp': time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            'SignatureVersion': '1.0',
-            'SignatureNonce': str(int(time.time() * 1000))
+        self.stop_event = threading.Event()
+        self.current_ip = None
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "AliDDNS/2.0"
         })
-        
-        sorted_params = sorted(params.items())
-        canonicalized_query_string = ''
-        for key, value in sorted_params:
-            canonicalized_query_string += '&' + self.percent_encode(key) + '=' + self.percent_encode(value)
-        canonicalized_query_string = canonicalized_query_string[1:]
-        
-        string_to_sign = 'GET&%2F&' + self.percent_encode(canonicalized_query_string)
-        
-        key = self.config['AccessKeySecret'] + '&'
-        signature = base64.b64encode(
-            hmac.new(key.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha1).digest()
+
+        self.logger = self.setup_logger(self.config.get("LogFile", "aliddns.log"))
+
+    def setup_logger(self, log_file: str) -> logging.Logger:
+        logger = logging.getLogger("AliDDNS")
+        logger.setLevel(logging.INFO)
+
+        if logger.handlers:
+            return logger
+
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s"
         )
-        
-        params['Signature'] = signature.decode('utf-8')
-        return params
-    
-    def percent_encode(self, string):
-        result = urllib.parse.quote(string, safe='')
-        result = result.replace('+', '%20')
-        result = result.replace('*', '%2A')
-        result = result.replace('%7E', '~')
+
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+        return logger
+
+    def load_config(self, config_file: str) -> Dict[str, Any]:
+        with open(config_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def validate_config(self):
+        required_fields = [
+            "AccessKeyId",
+            "AccessKeySecret",
+            "DomainName",
+            "SubDomainName",
+            "Type",
+            "Interval"
+        ]
+        for field in required_fields:
+            if field not in self.config or self.config[field] in ("", None):
+                raise ValueError(f"配置项缺失: {field}")
+
+        self.config["Interval"] = int(self.config.get("Interval", 60))
+        self.config["TTL"] = int(self.config.get("TTL", 600))
+
+        if self.config["Interval"] <= 0:
+            raise ValueError("Interval 必须大于 0")
+
+        if self.config["TTL"] <= 0:
+            raise ValueError("TTL 必须大于 0")
+
+        if self.config["Type"] not in ("A", "AAAA"):
+            raise ValueError("Type 仅支持 A 或 AAAA")
+
+        if not isinstance(self.config.get("GetIpUrls", []), list):
+            raise ValueError("GetIpUrls 必须是列表")
+
+    def percent_encode(self, value: Any) -> str:
+        result = urllib.parse.quote(str(value), safe="")
+        result = result.replace("+", "%20")
+        result = result.replace("*", "%2A")
+        result = result.replace("%7E", "~")
         return result
-    
-    def api_request(self, action, extra_params=None):
-        params = {'Action': action}
+
+    def sign_request(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        signed = dict(params)
+        signed.update({
+            "Format": "JSON",
+            "Version": "2015-01-09",
+            "AccessKeyId": self.config["AccessKeyId"],
+            "SignatureMethod": "HMAC-SHA1",
+            "Timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "SignatureVersion": "1.0",
+            "SignatureNonce": str(uuid.uuid4())
+        })
+
+        sorted_params = sorted((k, str(v)) for k, v in signed.items())
+        canonicalized_query_string = "&".join(
+            f"{self.percent_encode(k)}={self.percent_encode(v)}"
+            for k, v in sorted_params
+        )
+
+        string_to_sign = "GET&%2F&" + self.percent_encode(canonicalized_query_string)
+        key = (self.config["AccessKeySecret"] + "&").encode("utf-8")
+        message = string_to_sign.encode("utf-8")
+
+        signature = base64.b64encode(
+            hmac.new(key, message, hashlib.sha1).digest()
+        ).decode("utf-8")
+
+        signed["Signature"] = signature
+        return signed
+
+    def api_request(self, action: str, extra_params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        params = {"Action": action}
         if extra_params:
             params.update(extra_params)
-        
+
         try:
             signed_params = self.sign_request(params)
-            response = requests.get(self.endpoint, params=signed_params, timeout=15)
+            response = self.session.get(self.endpoint, params=signed_params, timeout=15)
+            response.raise_for_status()
+
             result = response.json()
-            
-            if 'Code' in result:
-                error_msg = self.get_error_message(result['Code'], result.get('Message', ''))
-                print(f"API错误 {action}: {error_msg}")
+            if "Code" in result:
+                self.logger.error("API错误 %s: %s - %s", action, result.get("Code"), result.get("Message", ""))
                 return None
             return result
-        except requests.exceptions.RequestException as e:
-            print(f"网络请求失败: {e}")
+
+        except requests.RequestException as e:
+            self.logger.error("网络请求失败 %s: %s", action, e)
             return None
-        except json.JSONDecodeError:
-            print("API响应格式错误")
+        except json.JSONDecodeError as e:
+            self.logger.error("API响应不是合法JSON %s: %s", action, e)
             return None
         except Exception as e:
-            print(f"未知错误: {e}")
+            self.logger.exception("未知错误 %s: %s", action, e)
             return None
-    
-    def get_error_message(self, error_code, message):
-        errors = {
-            'InvalidAccessKeyId.NotFound': 'AccessKeyId不存在或无效',
-            'SignatureDoesNotMatch': '签名验证失败',
-            'DomainRecordDuplicate': '解析记录已存在',
-            'InvalidDomainName.NoExist': '域名不存在',
-            'Forbidden.RAM': '权限不足',
-            'Throttling': 'API调用频率限制',
-            'InvalidParameter': '参数错误'
-        }
-        return errors.get(error_code, f'未知错误: {error_code}')
-    
-    def describe_domain_records(self):
-        result = self.api_request('DescribeDomainRecords', {
-            'DomainName': self.config['DomainName'],
-            'RRKeyWord': self.config['SubDomainName'],
-            'Type': self.config['Type']
-        })
-        
-        if result and 'DomainRecords' in result:
-            records = result['DomainRecords'].get('Record', [])
-            for record in records:
-                if record.get('RR') == self.config['SubDomainName']:
-                    return record
-        return None
-    
-    def update_domain_record(self, record_id, ip):
-        result = self.api_request('UpdateDomainRecord', {
-            'RecordId': record_id,
-            'RR': self.config['SubDomainName'],
-            'Type': self.config['Type'],
-            'Value': ip,
-            'TTL': self.config.get('TTL', '600'),
-            'Line': self.config.get('Line', 'default')
-        })
-        
-        if result and 'RecordId' in result:
-            print(f"更新成功: {self.config['SubDomainName']}.{self.config['DomainName']} -> {ip}")
-            return True
-        return False
-    
-    def add_domain_record(self, ip):
-        result = self.api_request('AddDomainRecord', {
-            'DomainName': self.config['DomainName'],
-            'RR': self.config['SubDomainName'],
-            'Type': self.config['Type'],
-            'Value': ip,
-            'TTL': self.config.get('TTL', '600'),
-            'Line': self.config.get('Line', 'default')
-        })
-        
-        if result and 'RecordId' in result:
-            print(f"添加成功: {self.config['SubDomainName']}.{self.config['DomainName']} -> {ip}")
-            return True
-        return False
-    
-    def run(self):
-        print("DDNS服务启动")
-        print(f"域名: {self.config['SubDomainName']}.{self.config['DomainName']}")
-        print("输入 stop 停止服务")
-        print("----------------------------------------")
-        
-        while self.running:
+
+    def get_public_ip(self) -> Optional[str]:
+        ip_type = self.config["Type"]
+        urls = self.config.get("GetIpUrls", [])
+
+        for url in urls:
             try:
-                new_ip = self.get_public_ip()
-                if not new_ip:
-                    print("获取公网IP失败，5分钟后重试")
-                    time.sleep(300)
-                    continue
-                
-                print(f"当前公网IP: {new_ip}")
-                
-                if new_ip != self.current_ip:
-                    print("IP变化，更新解析记录")
-                    
-                    record = self.describe_domain_records()
-                    if record:
-                        if self.update_domain_record(record['RecordId'], new_ip):
-                            self.current_ip = new_ip
-                    else:
-                        if self.add_domain_record(new_ip):
-                            self.current_ip = new_ip
-                else:
-                    print("IP未变化")
-                
-                wait_minutes = int(self.config['Interval'])
-                print(f"{wait_minutes}分钟后再次检查")
-                print("----------------------------------------")
-                time.sleep(wait_minutes * 60)
-                
-            except KeyboardInterrupt:
-                break
+                response = self.session.get(url, timeout=8)
+                response.raise_for_status()
+                ip = response.text.strip()
+                if self.is_valid_ip(ip, ip_type):
+                    return ip
+                self.logger.warning("IP来源返回无效%s地址: %s -> %s", ip_type, url, ip)
+            except requests.RequestException as e:
+                self.logger.warning("获取公网IP失败: %s (%s)", url, e)
             except Exception as e:
-                print(f"运行异常: {e}")
-                time.sleep(60)
-        
-        print("服务已停止")
+                self.logger.warning("处理公网IP响应失败: %s (%s)", url, e)
+        return None
+
+    def is_valid_ip(self, ip: str, record_type: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(ip)
+            if record_type == "A":
+                return addr.version == 4
+            if record_type == "AAAA":
+                return addr.version == 6
+            return False
+        except ValueError:
+            return False
+
+    def describe_domain_record(self) -> Optional[Dict[str, Any]]:
+        result = self.api_request("DescribeDomainRecords", {
+            "DomainName": self.config["DomainName"],
+            "RRKeyWord": self.config["SubDomainName"],
+            "Type": self.config["Type"],
+            "PageSize": 100
+        })
+
+        if not result:
+            return None
+
+        records = result.get("DomainRecords", {}).get("Record", [])
+        for record in records:
+            if (
+                record.get("RR") == self.config["SubDomainName"]
+                and record.get("Type") == self.config["Type"]
+            ):
+                return record
+        return None
+
+    def update_domain_record(self, record_id: str, ip: str) -> bool:
+        result = self.api_request("UpdateDomainRecord", {
+            "RecordId": record_id,
+            "RR": self.config["SubDomainName"],
+            "Type": self.config["Type"],
+            "Value": ip,
+            "TTL": self.config["TTL"],
+            "Line": self.config.get("Line", "default")
+        })
+
+        if result and "RecordId" in result:
+            self.logger.info("更新成功: %s.%s -> %s",
+                             self.config["SubDomainName"],
+                             self.config["DomainName"],
+                             ip)
+            return True
+        return False
+
+    def add_domain_record(self, ip: str) -> bool:
+        result = self.api_request("AddDomainRecord", {
+            "DomainName": self.config["DomainName"],
+            "RR": self.config["SubDomainName"],
+            "Type": self.config["Type"],
+            "Value": ip,
+            "TTL": self.config["TTL"],
+            "Line": self.config.get("Line", "default")
+        })
+
+        if result and "RecordId" in result:
+            self.logger.info("添加成功: %s.%s -> %s",
+                             self.config["SubDomainName"],
+                             self.config["DomainName"],
+                             ip)
+            return True
+        return False
+
+    def sync_once(self):
+        new_ip = self.get_public_ip()
+        if not new_ip:
+            self.logger.warning("获取公网IP失败")
+            return
+
+        self.logger.info("当前公网IP: %s", new_ip)
+        record = self.describe_domain_record()
+
+        if record:
+            old_ip = record.get("Value")
+            if old_ip == new_ip:
+                self.logger.info("DNS记录未变化: %s", new_ip)
+                self.current_ip = new_ip
+                return
+
+            self.logger.info("检测到IP变化: %s -> %s", old_ip, new_ip)
+            if self.update_domain_record(record["RecordId"], new_ip):
+                self.current_ip = new_ip
+        else:
+            self.logger.info("未找到记录，准备新增解析")
+            if self.add_domain_record(new_ip):
+                self.current_ip = new_ip
+
+    def sleep_with_stop(self, seconds: int):
+        end_time = time.time() + seconds
+        while time.time() < end_time:
+            if self.stop_event.is_set():
+                break
+            time.sleep(1)
+
+    def run(self):
+        self.logger.info("DDNS服务启动")
+        self.logger.info("域名: %s.%s",
+                         self.config["SubDomainName"],
+                         self.config["DomainName"])
+
+        while not self.stop_event.is_set():
+            try:
+                self.sync_once()
+            except Exception as e:
+                self.logger.exception("运行异常: %s", e)
+
+            self.logger.info("%s 秒后再次检查", self.config["Interval"])
+            self.sleep_with_stop(self.config["Interval"])
+
+        self.logger.info("DDNS服务已停止")
+
+    def stop(self):
+        self.stop_event.set()
+
+
+def create_default_config(config_file="config.json"):
+    with open(config_file, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+    print(f"配置文件已创建: {config_file}")
+    print("请修改后重新运行。")
+
+
+def daemonize():
+    if os.name != "posix":
+        raise RuntimeError("daemon 模式仅支持类 Unix 系统")
+
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+
+    os.setsid()
+
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    with open("/dev/null", "r") as f:
+        os.dup2(f.fileno(), sys.stdin.fileno())
+    with open("/dev/null", "a+") as f:
+        os.dup2(f.fileno(), sys.stdout.fileno())
+        os.dup2(f.fileno(), sys.stderr.fileno())
+
 
 def main():
-    if not os.path.exists("config.json"):
-        config = {
-            "Interval": "1",
-            "AccessKeyId": "yourAccessKeyId",
-            "AccessKeySecret": "yourAccessKeySecret",
-            "DomainName": "ni3 de1 yu4 ming2",
-            "SubDomainName": "ni3 de1 zi3 yu4 ming2",
-            "Type": "A",
-            "Line": "default",
-            "TTL": "600",
-            "GetIpUrls": [
-                "https://api.ipify.org",
-                "https://ident.me"
-            ]
-        }
-        with open("config.json", "w", encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        print("配置文件已创建，请检查配置")
+    config_file = "config.json"
+
+    if not os.path.exists(config_file):
+        create_default_config(config_file)
         return
-    
-    ddns = AliDDNS()
-    
-    import threading
-    def listen_for_stop():
-        while True:
-            if input().strip().lower() == 'stop':
-                ddns.running = False
-                break
-    
-    stop_thread = threading.Thread(target=listen_for_stop, daemon=True)
-    stop_thread.start()
-    
-    ddns.run()
+
+    command = sys.argv[1] if len(sys.argv) > 1 else "run"
+
+    with open(config_file, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    pid_file = config.get("PidFile", "aliddns.pid")
+    pid = PidFile(pid_file)
+
+    if command == "status":
+        if pid.exists():
+            print(f"运行中, PID={pid.read_pid()}")
+        else:
+            print("未运行")
+        return
+
+    if command == "stop":
+        if not pid.exists():
+            print("服务未运行")
+            pid.remove()
+            return
+        old_pid = pid.read_pid()
+        try:
+            os.kill(old_pid, signal.SIGTERM)
+            print(f"已发送停止信号到 PID={old_pid}")
+        except Exception as e:
+            print(f"停止失败: {e}")
+        return
+
+    if command == "restart":
+        if pid.exists():
+            old_pid = pid.read_pid()
+            try:
+                os.kill(old_pid, signal.SIGTERM)
+                print(f"已停止旧进程 PID={old_pid}")
+                time.sleep(2)
+            except Exception as e:
+                print(f"停止旧进程失败: {e}")
+
+        command = "start"
+
+    if command == "start":
+        if pid.exists():
+            print(f"服务已在运行, PID={pid.read_pid()}")
+            return
+        daemonize()
+
+    elif command == "run":
+        if pid.exists():
+            print(f"服务已在运行, PID={pid.read_pid()}")
+            return
+
+    else:
+        print("用法: python aliddns.py [run|start|stop|restart|status]")
+        return
+
+    ddns = AliDDNS(config_file)
+
+    def handle_signal(signum, frame):
+        ddns.logger.info("收到停止信号: %s", signum)
+        ddns.stop()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    try:
+        pid.write()
+        ddns.run()
+    finally:
+        pid.remove()
+
 
 if __name__ == "__main__":
     main()
+
